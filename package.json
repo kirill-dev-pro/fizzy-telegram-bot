@@ -1,0 +1,14 @@
+{
+  "name": "banana-fizzy-telegram-bot",
+  "module": "src/bot.js",
+  "type": "module",
+  "scripts": {
+    "setup:db": "bun run scripts/setup-db.js",
+    "reset:db": "bun run scripts/reset-db.js",
+    "start": "bun run src/bot.js"
+  },
+  "dependencies": {
+    "@axiomhq/js": "^1.3.1",
+    "grammy": "^1.38.4"
+  }
+}
