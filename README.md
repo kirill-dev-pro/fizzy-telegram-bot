@@ -2,6 +2,8 @@
 
 A Telegram bot that creates cards on [Fizzy](https://fizzy.do) directly from group/topic conversations.
 
+![Fizzy Telegram Bot](cover.png)
+
 ## Features
 
 - Multi-account support — Save multiple Fizzy accounts with friendly aliases like work, personal, etc
@@ -208,6 +210,72 @@ When you reply to an image with a card creation command, the bot automatically d
 - **Setup Token (Private Chat)** — Opens private chat to set up tokens securely
 - **Help** — Usage instructions for group usage
 
+## Webhook Management
+
+After deployment, configure the webhook to tell Telegram where to send updates:
+
+```bash
+# Check webhook status
+bun run webhook:status
+
+# Set webhook (replace with your Railway URL)
+bun run webhook:set https://your-app.railway.app
+
+# Delete webhook (if needed)
+bun run webhook:delete
+```
+
+See [docs/WEBHOOK.md](docs/WEBHOOK.md) for complete webhook management guide.
+
+## Testing
+
+The bot includes a comprehensive test suite to verify your setup:
+
+```bash
+# Run all tests (recommended)
+bun test:all
+
+# Individual tests
+bun run test:tg         # Test Telegram API connection only
+bun run test:proxy      # Test proxy connection only
+bun run webhook:status  # Check webhook configuration
+```
+
+### What Gets Tested:
+
+1. **📡 Direct Telegram API Connection** - Tests connection to api.telegram.org
+2. **🌐 Proxy Connection** - Tests Cloudflare Worker proxy (if configured)
+3. **🪝 Webhook Status** - Verifies webhook is configured and working
+4. **🤖 Auto-Detection** - Validates automatic proxy fallback behavior
+
+### Example Output:
+
+```
+🧪 Running Bot Tests
+
+📡 Test 1: Direct Telegram API Connection
+   ✅ PASSED - Direct connection works!
+   Bot: @fizzydobot (FizzyBot)
+   Response time: 361ms
+
+🌐 Test 2: Proxy Connection
+   ✅ PASSED - Proxy connection works!
+   Response time: 77ms
+
+🪝 Test 3: Webhook Status
+   ✅ PASSED - Webhook working normally!
+   URL: https://fizzy-tg-bot-production.up.railway.app
+   Pending updates: 0
+
+🤖 Test 4: Auto-Detection Behavior
+   ✅ PASSED - Optimal setup detected!
+
+📊 Test Summary (4)
+✅ Passed: 4
+
+🎉 All tests passed! Your bot is ready to go!
+```
+
 ## Local Development
 
 ```bash
@@ -216,6 +284,9 @@ bun install
 
 # Setup database
 bun run setup:db
+
+# Verify setup (recommended before first run)
+bun test:all
 
 # Run locally
 bun run start
@@ -235,6 +306,21 @@ AXIOM_DATASET=fizzy-telegram-bot
 
 We're using Railway (works with persistent storage) but you can use whatever you want.
 
+### Telegram API Proxy (Railway / Blocked Networks)
+
+If your hosting provider blocks Telegram API access, you can use a Cloudflare Worker proxy. See [docs/CLOUDFLARE_PROXY.md](docs/CLOUDFLARE_PROXY.md) for detailed setup instructions.
+
+**Automatic Fallback:**
+The bot automatically tries direct connection first, then falls back to the proxy if the direct connection fails. This means:
+- ✅ Works on Railway (uses proxy automatically)
+- ✅ Works locally (uses direct connection)
+- ✅ No manual configuration needed per environment
+
+Quick setup:
+1. Deploy the `cloudflare-worker.js` to Cloudflare Workers (free tier)
+2. Add `TELEGRAM_API_PROXY_URL` to your environment variables
+3. The bot automatically detects if it needs the proxy and uses it
+
 ### Example with Railway
 
 1. Push code to GitHub
@@ -242,6 +328,7 @@ We're using Railway (works with persistent storage) but you can use whatever you
 3. Enable Volume in Railway dashboard (for persistent SQLite storage)
 4. Add environment variables:
    - `BOT_TOKEN` (required)
+   - `TELEGRAM_API_PROXY_URL` (optional, needed if Railway blocks Telegram API)
    - `AXIOM_API_TOKEN` (optional, for log monitoring)
    - `AXIOM_DATASET` (optional, defaults to "fizzy-telegram-bot")
 5. Deploy — gets public URL (e.g., `https://bot-app-url.up.railway.app`)
@@ -277,6 +364,22 @@ FORCE_DB_SETUP=true bun run setup:db
 
 > **Warning:** `bun run scripts/reset-db.js` will delete all data (tokens, boards, chat links). Use this when upgrading schema or starting fresh.
 
+## Error Handling
+
+The bot gracefully handles common Telegram API errors:
+
+- **403 Forbidden** - User blocked the bot or left the chat
+  - Logged as warning, doesn't crash the bot
+  - Bot continues processing other messages
+- **429 Rate Limit** - Too many requests to Telegram API
+  - Logged with retry-after time
+  - Bot automatically handles rate limiting
+- **400 Bad Request** - Invalid parameters in API calls
+  - Logged as warning for debugging
+  - Prevents bot crashes from malformed data
+
+These errors are expected in production and are handled gracefully without affecting other users.
+
 ## Security
 
 - Personal tokens are **only accepted in private chat** — never in groups
@@ -310,7 +413,7 @@ AXIOM_DATASET=fizzy-telegram-bot
 LOG_LEVEL=info  # Options: debug, info, warn, error
 ```
 
-For detailed setup instructions, see [LOGGING.md](LOGGING.md).
+For detailed setup instructions, see [docs/LOGGING.md](docs/LOGGING.md).
 
 ### What Gets Logged
 

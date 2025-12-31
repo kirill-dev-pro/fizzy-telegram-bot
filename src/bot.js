@@ -18,12 +18,63 @@ import { logger } from "./logger";
 if (!Bun.env.BOT_TOKEN) {
   throw new Error("BOT_TOKEN environment variable is required but not set");
 }
-const bot = new Bot(Bun.env.BOT_TOKEN);
 
-const botInfo = await bot.api.getMe();
-const botUsername = botInfo.username;
+// Auto-detect whether to use proxy based on connection success
+let bot;
+let botUsername = Bun.env.BOT_USERNAME || "unknown";
+let usingProxy = false;
 
-logger.info("Bot initialized", { username: botUsername });
+// Try direct connection first
+logger.info("Attempting direct Telegram API connection...");
+let directBot = new Bot(Bun.env.BOT_TOKEN);
+
+try {
+  const botInfo = await directBot.api.getMe();
+  botUsername = botInfo.username;
+  bot = directBot;
+  logger.info("Direct connection successful", { username: botUsername });
+} catch (directError) {
+  logger.warn("Direct connection failed", { error: directError.message });
+
+  // Try proxy if configured
+  if (Bun.env.TELEGRAM_API_PROXY_URL) {
+    logger.info("Attempting connection via proxy...", {
+      proxyUrl: Bun.env.TELEGRAM_API_PROXY_URL,
+    });
+
+    const proxyBot = new Bot(Bun.env.BOT_TOKEN, {
+      apiRoot: Bun.env.TELEGRAM_API_PROXY_URL,
+    });
+
+    try {
+      const botInfo = await proxyBot.api.getMe();
+      botUsername = botInfo.username;
+      bot = proxyBot;
+      usingProxy = true;
+      logger.info("Proxy connection successful", {
+        username: botUsername,
+        proxyUrl: Bun.env.TELEGRAM_API_PROXY_URL,
+      });
+    } catch (proxyError) {
+      logger.error("Both direct and proxy connections failed", {
+        directError: directError.message,
+        proxyError: proxyError.message,
+      });
+      // Use proxy bot anyway - webhooks might still work
+      bot = proxyBot;
+      usingProxy = true;
+      logger.warn("Starting in degraded mode with proxy", {
+        fallbackUsername: botUsername,
+      });
+    }
+  } else {
+    logger.warn("No proxy configured, starting in degraded mode", {
+      fallbackUsername: botUsername,
+      suggestion: "Set TELEGRAM_API_PROXY_URL to use Cloudflare Worker proxy",
+    });
+    bot = directBot;
+  }
+}
 
 // ===== Regexes =====
 
@@ -90,7 +141,11 @@ async function getImageFromReply(ctx, msg) {
   const fileId = largestPhoto.file_id;
 
   const file = await ctx.api.getFile(fileId);
-  const downloadUrl = `https://api.telegram.org/file/bot${Bun.env.BOT_TOKEN}/${file.file_path}`;
+  // Use proxy for file downloads if we're using proxy for API calls
+  const apiRoot = usingProxy && Bun.env.TELEGRAM_API_PROXY_URL
+    ? Bun.env.TELEGRAM_API_PROXY_URL
+    : "https://api.telegram.org";
+  const downloadUrl = `${apiRoot}/file/bot${Bun.env.BOT_TOKEN}/${file.file_path}`;
 
   const response = await fetch(downloadUrl);
   const arrayBuffer = await response.arrayBuffer();
@@ -427,7 +482,12 @@ bot.on("message:text", async (ctx) => {
     !text.match(CONFIG_TOKEN_REGEX)
   ) {
     if (text.match(CONFIG_TOKEN_LONELY_REGEX)) {
-      logger.command("/config_token", "validation", "lonely", getSenderInfo(msg));
+      logger.command(
+        "/config_token",
+        "validation",
+        "lonely",
+        getSenderInfo(msg)
+      );
       return ctx.reply(MESSAGES.configTokenMissingArgs(isPrivate), {
         parse_mode: "Markdown",
       });
@@ -490,7 +550,12 @@ bot.on("message:text", async (ctx) => {
     !text.match(DELETE_ACCOUNT_REGEX)
   ) {
     if (text.match(DELETE_ACCOUNT_LONELY_REGEX)) {
-      logger.command("/delete_account", "validation", "lonely", getSenderInfo(msg));
+      logger.command(
+        "/delete_account",
+        "validation",
+        "lonely",
+        getSenderInfo(msg)
+      );
       return ctx.reply(MESSAGES.deleteAccountMissingAlias);
     }
     logger.command(
@@ -544,7 +609,12 @@ bot.on("message:text", async (ctx) => {
     !text.match(CONFIG_BOARD_REGEX)
   ) {
     if (text.match(CONFIG_BOARD_LONELY_REGEX)) {
-      logger.command("/config_board", "validation", "lonely", getSenderInfo(msg));
+      logger.command(
+        "/config_board",
+        "validation",
+        "lonely",
+        getSenderInfo(msg)
+      );
       return ctx.reply(MESSAGES.configBoardMissingId);
     }
 
@@ -653,7 +723,12 @@ bot.on("message:text", async (ctx) => {
         getSenderInfo(msg)
       );
       return ctx.reply(
-        MESSAGES.boardSet(boardId, boardInfo.name, finalChatLink.alias, tokenData.account_slug)
+        MESSAGES.boardSet(
+          boardId,
+          boardInfo.name,
+          finalChatLink.alias,
+          tokenData.account_slug
+        )
       );
     }
 
@@ -948,14 +1023,107 @@ bot.on("message:text", async (ctx) => {
   // Ignore other messages
 });
 
-bot.catch((err) =>
-  logger.error("Bot error", { error: err.message, stack: err.stack })
-);
+// Enhanced error handler for common Telegram API errors
+bot.catch((err) => {
+  const ctx = err.ctx;
+  const error = err.error;
+
+  // Check if it's a GrammyError with API error details
+  const apiError = error.error || error;
+  const errorCode = apiError.error_code || error.code;
+  const errorMessage = error.message || apiError.description || String(error);
+
+  // Handle specific error cases gracefully
+  if (
+    errorCode === 403 ||
+    errorMessage.includes("Forbidden") ||
+    errorMessage.includes("blocked")
+  ) {
+    // User blocked the bot or chat not found
+    logger.warn("Bot blocked or forbidden", {
+      error: errorMessage,
+      userId: ctx.from?.id,
+      chatId: ctx.chat?.id,
+      username: ctx.from?.username || ctx.from?.first_name,
+    });
+    // Don't rethrow - error is handled
+    return;
+  }
+
+  if (errorCode === 429 || errorMessage.includes("Too Many Requests")) {
+    // Rate limited - too many requests
+    logger.warn("Rate limited by Telegram API", {
+      error: errorMessage,
+      retryAfter: apiError.parameters?.retry_after,
+    });
+    // Don't rethrow - error is handled
+    return;
+  }
+
+  if (errorCode === 400 || errorMessage.includes("Bad Request")) {
+    // Bad request - usually invalid parameters
+    logger.warn("Bad request to Telegram API", {
+      error: errorMessage,
+      method: apiError.method,
+      userId: ctx.from?.id,
+    });
+    // Don't rethrow - error is handled
+    return;
+  }
+
+  // Log unexpected errors with full details
+  logger.error("Unexpected bot error", {
+    error: errorMessage,
+    errorCode: errorCode,
+    method: apiError.method,
+    userId: ctx.from?.id,
+    chatId: ctx.chat?.id,
+  });
+
+  // Don't rethrow unexpected errors either - let webhook return 200 OK
+});
 
 // === Webhook Server ===
-const handle = webhookCallback(bot, "std/http");
+// Configure webhook to always return 200 OK, even on errors
+const handle = webhookCallback(bot, "std/http", {
+  onTimeout: () => {
+    logger.warn("Webhook timeout - request took too long");
+  },
+  timeoutMilliseconds: 10000, // 10 second timeout
+});
+
 const port = Number(Bun.env.PORT || 3000);
 
-serve({ port, hostname: "0.0.0.0", fetch: handle });
+// Wrap handler to ensure we always return a valid response
+const loggingHandler = async (request) => {
+  const url = new URL(request.url);
+
+  // Health check endpoint for Railway
+  if (request.method === "GET" && url.pathname === "/health") {
+    return new Response(JSON.stringify({ status: "ok", bot: botUsername }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  try {
+    const response = await handle(request);
+    return response;
+  } catch (error) {
+    // Log the error but ALWAYS return 200 OK to prevent Telegram retries
+    // Grammy's bot.catch() already logged the bot-specific error
+    logger.error("Webhook handler exception", {
+      path: url.pathname,
+      error: error.message,
+      stack: error.stack,
+    });
+
+    // Return 200 OK even on error to prevent 502s
+    // Telegram considers this update processed
+    return new Response("OK", { status: 200 });
+  }
+};
+
+serve({ port, hostname: "0.0.0.0", fetch: loggingHandler });
 
 logger.info("Fizzy Telegram bot started", { port, hostname: "0.0.0.0" });
